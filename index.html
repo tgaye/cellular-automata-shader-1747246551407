@@ -1,0 +1,864 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cellular Automata Shader</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: Arial, sans-serif;
+        }
+        #canvas-container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: center;
+            position: relative;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 5px;
+            color: white;
+            max-width: 250px;
+            z-index: 100;
+        }
+        #ui h2 {
+            margin-top: 0;
+            font-size: 16px;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        label {
+            display: block;
+            font-size: 12px;
+            margin-bottom: 3px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        .value-display {
+            font-size: 11px;
+            color: #aaa;
+            text-align: right;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            margin: 2px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        button:hover {
+            background: #444;
+        }
+        #toggle-ui {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            z-index: 101;
+        }
+    </style>
+
+<base target="_self">
+
+
+    </head><body><div id="canvas-container"></div>
+    <div id="ui">
+        <button id="toggle-ui">Hide UI</button>
+        <h2>Cellular Automata Controls</h2>
+        
+        <div class="control-group">
+            <label for="speed">Simulation Speed</label>
+            <input type="range" id="speed" min="0" max="2" step="0.1" value="1">
+            <div class="value-display" id="speed-value">1.0</div>
+        </div>
+        
+        <div class="control-group">
+            <label for="color-speed">Color Evolution Speed</label>
+            <input type="range" id="color-speed" min="0" max="1" step="0.05" value="0.2">
+            <div class="value-display" id="color-speed-value">0.2</div>
+        </div>
+        
+        <div class="control-group">
+            <label for="brush-size">Brush Size</label>
+            <input type="range" id="brush-size" min="1" max="20" step="1" value="5">
+            <div class="value-display" id="brush-size-value">5</div>
+        </div>
+        
+        <div class="control-group">
+            <label for="rule-select">Rule Set</label>
+            <select id="rule-select">
+                <option value="0">Game of Life (B3/S23)</option>
+                <option value="1">High Life (B36/S23)</option>
+                <option value="2">Maze (B3/S12345)</option>
+                <option value="3">Replicator (B1357/S1357)</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label>Preset Patterns</label>
+            <div>
+                <button id="glider">Glider</button>
+                <button id="pulsar">Pulsar</button>
+                <button id="random">Random</button>
+                <button id="clear">Clear</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Check for WebGL support
+        if (!WebGLRenderingContext) {
+            const container = document.getElementById('canvas-container');
+            container.innerHTML = '<div style="color: white; text-align: center; padding: 20px;">Your browser does not support WebGL. Please try with a modern browser.</div>';
+            throw new Error('WebGL not supported');
+        }
+
+        // Three.js setup
+        const container = document.getElementById('canvas-container');
+        const width = Math.min(window.innerWidth, 1200);
+        const height = width / (16/9);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        container.appendChild(renderer.domElement);
+
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        
+        // Create render targets for ping-pong rendering
+        const rtParams = {
+            minFilter: THREE.NearestFilter,
+            magFilter: THREE.NearestFilter,
+            format: THREE.RGBAFormat,
+            type: THREE.FloatType
+        };
+        
+        const rt1 = new THREE.WebGLRenderTarget(width, height, rtParams);
+        const rt2 = new THREE.WebGLRenderTarget(width, height, rtParams);
+        let current = rt1;
+        let previous = rt2;
+        
+        // Create full-screen quad
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        
+        // Shader uniforms
+        const uniforms = {
+            u_resolution: { value: new THREE.Vector2(width, height) },
+            u_mouse: { value: new THREE.Vector2(0, 0) },
+            u_time: { value: 0 },
+            u_delta: { value: 0 },
+            u_previous: { value: previous.texture },
+            u_brush: { value: 0 },
+            u_brush_pos: { value: new THREE.Vector2(0, 0) },
+            u_brush_size: { value: 5 },
+            u_rule_set: { value: 0 },
+            u_color_speed: { value: 0.2 }
+        };
+        
+        // Main shader material
+        const material = new THREE.ShaderMaterial({
+            uniforms: uniforms,
+            vertexShader: `
+                varying vec2 vUv;
+                
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                precision highp float;
+                
+                uniform vec2 u_resolution;
+                uniform vec2 u_mouse;
+                uniform float u_time;
+                uniform float u_delta;
+                uniform sampler2D u_previous;
+                uniform float u_brush;
+                uniform vec2 u_brush_pos;
+                uniform float u_brush_size;
+                uniform int u_rule_set;
+                uniform float u_color_speed;
+                
+                varying vec2 vUv;
+                
+                // Game of Life rules
+                int gameOfLife(int neighbors, int current) {
+                    if (current == 1) {
+                        if (neighbors < 2) return 0;
+                        if (neighbors > 3) return 0;
+                        return 1;
+                    } else {
+                        if (neighbors == 3) return 1;
+                        return 0;
+                    }
+                }
+                
+                // High Life rules (B36/S23)
+                int highLife(int neighbors, int current) {
+                    if (current == 1) {
+                        if (neighbors < 2) return 0;
+                        if (neighbors > 3) return 0;
+                        return 1;
+                    } else {
+                        if (neighbors == 3 || neighbors == 6) return 1;
+                        return 0;
+                    }
+                }
+                
+                // Maze rules (B3/S12345)
+                int maze(int neighbors, int current) {
+                    if (current == 1) {
+                        if (neighbors >= 1 && neighbors <= 5) return 1;
+                        return 0;
+                    } else {
+                        if (neighbors == 3) return 1;
+                        return 0;
+                    }
+                }
+                
+                // Replicator rules (B1357/S1357)
+                int replicator(int neighbors, int current) {
+                    if (neighbors == 1 || neighbors == 3 || neighbors == 5 || neighbors == 7) return 1;
+                    return 0;
+                }
+                
+                // Get cell state (1 = alive, 0 = dead)
+                float getState(vec4 color) {
+                    return step(0.1, color.a);
+                }
+                
+                // Get cell color
+                vec3 getColor(vec4 color) {
+                    return color.rgb;
+                }
+                
+                // Count live neighbors
+                int countNeighbors(vec2 uv) {
+                    int count = 0;
+                    vec2 pixelSize = 1.0 / u_resolution;
+                    
+                    for (int y = -1; y <= 1; y++) {
+                        for (int x = -1; x <= 1; x++) {
+                            if (x == 0 && y == 0) continue;
+                            
+                            vec2 neighborUV = uv + vec2(float(x), float(y)) * pixelSize;
+                            vec4 neighbor = texture2D(u_previous, neighborUV);
+                            count += int(getState(neighbor));
+                        }
+                    }
+                    
+                    return count;
+                }
+                
+                // Apply brush effect
+                vec4 applyBrush(vec2 uv, vec4 current) {
+                    if (u_brush > 0.5) {
+                        float dist = distance(uv, u_brush_pos) * u_resolution.x / u_brush_size;
+                        if (dist < 1.0) {
+                        return vec4(0.5 + 0.5 * sin(u_time * 0.5), 
+                                0.5 + 0.5 * sin(u_time * 0.3), 
+                                0.5 + 0.5 * sin(u_time * 0.7),
+                                1.0);
+                        }
+                    }
+                    return current;
+                }
+                
+                // Main shader function
+                void main() {
+                    vec2 uv = vUv;
+                    vec4 prev = texture2D(u_previous, uv);
+                    vec4 current = prev;
+                    
+                    // Apply brush if active
+                    current = applyBrush(uv, current);
+                    
+                    // Only update simulation when brush is not active
+                    if (u_brush < 0.5) {
+                        int neighbors = countNeighbors(uv);
+                        int currentState = int(getState(prev));
+                        int newState = 0;
+                        
+                        // Apply selected rule set
+                        if (u_rule_set == 0) {
+                            newState = gameOfLife(neighbors, currentState);
+                        } else if (u_rule_set == 1) {
+                            newState = highLife(neighbors, currentState);
+                        } else if (u_rule_set == 2) {
+                            newState = maze(neighbors, currentState);
+                        } else if (u_rule_set == 3) {
+                            newState = replicator(neighbors, currentState);
+                        }
+                        
+                        if (newState == 1) {
+                            // Cell is alive - calculate color based on neighbors
+                            vec3 avgColor = vec3(0.0);
+                            int colorCount = 0;
+                            vec2 pixelSize = 1.0 / u_resolution;
+                            
+                            for (int y = -1; y <= 1; y++) {
+                                for (int x = -1; x <= 1; x++) {
+                                    if (x == 0 && y == 0) continue;
+                                    
+                                    vec2 neighborUV = uv + vec2(float(x), float(y)) * pixelSize;
+                                    vec4 neighbor = texture2D(u_previous, neighborUV);
+                                    if (getState(neighbor) > 0.5) {
+                                        avgColor += getColor(neighbor);
+                                        colorCount++;
+                                    }
+                                }
+                            }
+                            
+                            if (colorCount > 0) {
+                                avgColor /= float(colorCount);
+                                // Mix with previous color based on color speed
+                                vec3 prevColor = getColor(prev);
+                                vec3 newColor = mix(prevColor, avgColor, u_color_speed);
+                                
+                                // Add some variation based on position and time
+                                newColor = mix(newColor, 
+                                    vec3(
+                                        0.5 + 0.5 * sin(u_time * 0.1 + uv.x * 10.0),
+                                        0.5 + 0.5 * sin(u_time * 0.15 + uv.y * 10.0),
+                                        0.5 + 0.5 * sin(u_time * 0.2 + (uv.x + uv.y) * 5.0)
+                                    ), 
+                                    0.1);
+                                
+                                current = vec4(newColor, 1.0);
+                            } else {
+                                // New cell with no neighbors - random color
+                                current = vec4(
+                                    0.5 + 0.5 * sin(u_time * 0.1 + uv.x * 10.0),
+                                    0.5 + 0.5 * sin(u_time * 0.15 + uv.y * 10.0),
+                                    0.5 + 0.5 * sin(u_time * 0.2 + (uv.x + uv.y) * 5.0),
+                                    1.0
+                                );
+                            }
+                        } else {
+                            // Cell is dead - fade out if it was previously alive
+                            if (currentState == 1) {
+                                current = vec4(getColor(prev) * 0.9, 0.9 * prev.a);
+                            }
+                        }
+                    }
+                    
+                    gl_FragColor = current;
+                }
+            `
+        });
+        
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+        
+        // Initialize simulation with random pattern
+        function initializeRandom() {
+            const initMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_resolution: { value: new THREE.Vector2(width, height) },
+                    u_seed: { value: Math.random() }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+                    uniform vec2 u_resolution;
+                    uniform float u_seed;
+                    varying vec2 vUv;
+                    
+                    float random(vec2 st) {
+                        return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453);
+                    }
+                    
+                    void main() {
+                        vec2 uv = vUv;
+                        float rnd = random(uv + u_seed);
+                        
+                        if (rnd > 0.9) {
+                            gl_FragColor = vec4(
+                                0.5 + 0.5 * sin(u_seed + uv.x * 10.0),
+                                0.5 + 0.5 * sin(u_seed + uv.y * 10.0),
+                                0.5 + 0.5 * sin(u_seed + (uv.x + uv.y) * 5.0),
+                                1.0
+                            );
+                        } else {
+                            gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+                        }
+                    }
+                `
+            });
+            
+            const initMesh = new THREE.Mesh(geometry, initMaterial);
+            scene.add(initMesh);
+            
+            renderer.setRenderTarget(previous);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(current);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(null);
+            
+            scene.remove(initMesh);
+        }
+        
+        // Initialize with glider pattern
+        function initializeGlider() {
+            const initMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_resolution: { value: new THREE.Vector2(width, height) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+    precision highp float;
+    
+    uniform vec2 u_resolution;
+    uniform vec2 u_mouse;
+    uniform float u_time;
+    uniform float u_delta;
+    uniform sampler2D u_previous;
+    uniform float u_brush;
+    uniform vec2 u_brush_pos;
+    uniform float u_brush_size;
+    uniform int u_rule_set;
+    uniform float u_color_speed;
+    
+    varying vec2 vUv;
+    
+    // Game of Life rules
+    int gameOfLife(int neighbors, int current) {
+        if (current == 1) {
+            if (neighbors < 2) return 0;
+            if (neighbors > 3) return 0;
+            return 1;
+        } else {
+            if (neighbors == 3) return 1;
+            return 0;
+        }
+    }
+    
+    // High Life rules (B36/S23)
+    int highLife(int neighbors, int current) {
+        if (current == 1) {
+            if (neighbors < 2) return 0;
+            if (neighbors > 3) return 0;
+            return 1;
+        } else {
+            if (neighbors == 3 || neighbors == 6) return 1;
+            return 0;
+        }
+    }
+    
+    // Maze rules (B3/S12345)
+    int maze(int neighbors, int current) {
+        if (current == 1) {
+            if (neighbors >= 1 && neighbors <= 5) return 1;
+            return 0;
+        } else {
+            if (neighbors == 3) return 1;
+            return 0;
+        }
+    }
+    
+    // Replicator rules (B1357/S1357)
+    int replicator(int neighbors, int current) {
+        if (neighbors == 1 || neighbors == 3 || neighbors == 5 || neighbors == 7) return 1;
+        return 0;
+    }
+    
+    // Get cell state (1 = alive, 0 = dead)
+    float getState(vec4 color) {
+        return step(0.1, color.a);
+    }
+    
+    // Get cell color
+    vec3 getColor(vec4 color) {
+        return color.rgb;
+    }
+    
+    // Count live neighbors
+    int countNeighbors(vec2 uv) {
+        int count = 0;
+        vec2 pixelSize = 1.0 / u_resolution;
+        
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                if (x == 0 && y == 0) continue;
+                
+                vec2 neighborUV = uv + vec2(float(x), float(y)) * pixelSize;
+                vec4 neighbor = texture2D(u_previous, neighborUV);
+                count += int(getState(neighbor));
+            }
+        }
+        
+        return count;
+    }
+    
+    // Apply brush effect - FIXED VERSION
+    vec4 applyBrush(vec2 uv, vec4 current) {
+        if (u_brush > 0.5) {
+            float dist = distance(uv, u_brush_pos) * u_resolution.x / u_brush_size;
+            if (dist < 1.0) {
+                return vec4(0.5 + 0.5 * sin(u_time * 0.5), 
+                           0.5 + 0.5 * sin(u_time * 0.3), 
+                           0.5 + 0.5 * sin(u_time * 0.7),
+                           1.0);
+            }
+        }
+        return current;
+    }
+    
+    // Main shader function
+    void main() {
+        vec2 uv = vUv;
+        vec4 prev = texture2D(u_previous, uv);
+        vec4 current = prev;
+        
+        // Apply brush if active
+        current = applyBrush(uv, current);
+        
+        // Only update simulation when brush is not active
+        if (u_brush < 0.5) {
+            int neighbors = countNeighbors(uv);
+            int currentState = int(getState(prev));
+            int newState = 0;
+            
+            // Apply selected rule set
+            if (u_rule_set == 0) {
+                newState = gameOfLife(neighbors, currentState);
+            } else if (u_rule_set == 1) {
+                newState = highLife(neighbors, currentState);
+            } else if (u_rule_set == 2) {
+                newState = maze(neighbors, currentState);
+            } else if (u_rule_set == 3) {
+                newState = replicator(neighbors, currentState);
+            }
+            
+            if (newState == 1) {
+                // Cell is alive - calculate color based on neighbors
+                vec3 avgColor = vec3(0.0);
+                int colorCount = 0;
+                vec2 pixelSize = 1.0 / u_resolution;
+                
+                for (int y = -1; y <= 1; y++) {
+                    for (int x = -1; x <= 1; x++) {
+                        if (x == 0 && y == 0) continue;
+                        
+                        vec2 neighborUV = uv + vec2(float(x), float(y)) * pixelSize;
+                        vec4 neighbor = texture2D(u_previous, neighborUV);
+                        if (getState(neighbor) > 0.5) {
+                            avgColor += getColor(neighbor);
+                            colorCount++;
+                        }
+                    }
+                }
+                
+                if (colorCount > 0) {
+                    avgColor /= float(colorCount);
+                    // Mix with previous color based on color speed
+                    vec3 prevColor = getColor(prev);
+                    vec3 newColor = mix(prevColor, avgColor, u_color_speed);
+                    
+                    // Add some variation based on position and time
+                    newColor = mix(newColor, 
+                        vec3(
+                            0.5 + 0.5 * sin(u_time * 0.1 + uv.x * 10.0),
+                            0.5 + 0.5 * sin(u_time * 0.15 + uv.y * 10.0),
+                            0.5 + 0.5 * sin(u_time * 0.2 + (uv.x + uv.y) * 5.0)
+                        ), 
+                        0.1);
+                    
+                    current = vec4(newColor, 1.0);
+                } else {
+                    // New cell with no neighbors - random color
+                    current = vec4(
+                        0.5 + 0.5 * sin(u_time * 0.1 + uv.x * 10.0),
+                        0.5 + 0.5 * sin(u_time * 0.15 + uv.y * 10.0),
+                        0.5 + 0.5 * sin(u_time * 0.2 + (uv.x + uv.y) * 5.0),
+                        1.0
+                    );
+                }
+            } else {
+                // Cell is dead - fade out if it was previously alive
+                if (currentState == 1) {
+                    current = vec4(getColor(prev) * 0.9, 0.9 * prev.a);
+                }
+            }
+        }
+        
+        gl_FragColor = current;
+    }
+`
+            });
+            
+            const initMesh = new THREE.Mesh(geometry, initMaterial);
+            scene.add(initMesh);
+            
+            renderer.setRenderTarget(previous);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(current);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(null);
+            
+            scene.remove(initMesh);
+        }
+        
+        // Initialize with pulsar pattern
+        function initializePulsar() {
+            const initMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_resolution: { value: new THREE.Vector2(width, height) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+                    uniform vec2 u_resolution;
+                    varying vec2 vUv;
+                    
+                    void main() {
+                        vec2 uv = vUv;
+                        vec2 center = vec2(0.5, 0.5);
+                        vec2 pixel = floor(uv * u_resolution / 20.0);
+                        
+                        // Pulsar pattern
+                        if (distance(pixel, center) < 8.0) {
+                            // Outer blocks
+                            if ((abs(pixel.x - center.x) == 6.0 && abs(pixel.y - center.y) <= 2.0) ||
+                                (abs(pixel.y - center.y) == 6.0 && abs(pixel.x - center.x) <= 2.0)) {
+                                gl_FragColor = vec4(0.2, 0.5, 1.0, 1.0);
+                                return;
+                            }
+                            
+                            // Inner blocks
+                            if ((abs(pixel.x - center.x) == 4.0 && abs(pixel.y - center.y) <= 2.0) ||
+                                (abs(pixel.y - center.y) == 4.0 && abs(pixel.x - center.x) <= 2.0)) {
+                                gl_FragColor = vec4(0.2, 0.5, 1.0, 1.0);
+                                return;
+                            }
+                        }
+                        
+                        gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+                    }
+                `
+            });
+            
+            const initMesh = new THREE.Mesh(geometry, initMaterial);
+            scene.add(initMesh);
+            
+            renderer.setRenderTarget(previous);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(current);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(null);
+            
+            scene.remove(initMesh);
+        }
+        
+        // Clear the simulation
+        function clearSimulation() {
+            const clearMaterial = new THREE.ShaderMaterial({
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+                    varying vec2 vUv;
+                    void main() {
+                        gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+                    }
+                `
+            });
+            
+            const clearMesh = new THREE.Mesh(geometry, clearMaterial);
+            scene.add(clearMesh);
+            
+            renderer.setRenderTarget(previous);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(current);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(null);
+            
+            scene.remove(clearMesh);
+        }
+        
+        // Initialize with random pattern
+        initializeRandom();
+        
+        // Mouse/touch interaction
+        const mouse = new THREE.Vector2();
+        let isDrawing = false;
+        
+        function onPointerMove(event) {
+            if (!isDrawing) return;
+            
+            // Calculate normalized device coordinates
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            
+            // Convert to UV coordinates - FIXED
+            const uvX = (mouse.x + 1) / 2;
+            const uvY = (mouse.y + 1) / 2; // Remove the negative sign here
+            
+            uniforms.u_brush_pos.value.set(uvX, uvY);
+        }
+        
+        function onPointerDown(event) {
+            isDrawing = true;
+            uniforms.u_brush.value = 1;
+            onPointerMove(event);
+        }
+        
+        function onPointerUp() {
+            isDrawing = false;
+            uniforms.u_brush.value = 0;
+        }
+        
+        // Add event listeners
+        renderer.domElement.addEventListener('mousedown', onPointerDown);
+        renderer.domElement.addEventListener('mousemove', onPointerMove);
+        renderer.domElement.addEventListener('mouseup', onPointerUp);
+        renderer.domElement.addEventListener('mouseleave', onPointerUp);
+        
+        renderer.domElement.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            onPointerDown(e.touches[0]);
+        });
+        
+        renderer.domElement.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            onPointerMove(e.touches[0]);
+        });
+        
+        renderer.domElement.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            onPointerUp();
+        });
+        
+        // UI controls
+        document.getElementById('speed').addEventListener('input', (e) => {
+            const value = parseFloat(e.target.value);
+            document.getElementById('speed-value').textContent = value.toFixed(1);
+        });
+        
+        document.getElementById('color-speed').addEventListener('input', (e) => {
+            const value = parseFloat(e.target.value);
+            uniforms.u_color_speed.value = value;
+            document.getElementById('color-speed-value').textContent = value.toFixed(2);
+        });
+        
+        document.getElementById('brush-size').addEventListener('input', (e) => {
+            const value = parseInt(e.target.value);
+            uniforms.u_brush_size.value = value;
+            document.getElementById('brush-size-value').textContent = value;
+        });
+        
+        document.getElementById('rule-select').addEventListener('change', (e) => {
+            uniforms.u_rule_set.value = parseInt(e.target.value);
+        });
+        
+        document.getElementById('glider').addEventListener('click', initializeGlider);
+        document.getElementById('pulsar').addEventListener('click', initializePulsar);
+        document.getElementById('random').addEventListener('click', initializeRandom);
+        document.getElementById('clear').addEventListener('click', clearSimulation);
+        
+        // Toggle UI visibility
+        document.getElementById('toggle-ui').addEventListener('click', () => {
+            const ui = document.getElementById('ui');
+            if (ui.style.display === 'none') {
+                ui.style.display = 'block';
+                document.getElementById('toggle-ui').textContent = 'Hide UI';
+            } else {
+                ui.style.display = 'none';
+                document.getElementById('toggle-ui').textContent = 'Show UI';
+            }
+        });
+        
+        // Handle window resize
+        function onWindowResize() {
+            const newWidth = Math.min(window.innerWidth, 1200);
+            const newHeight = newWidth / (16/9);
+            
+            renderer.setSize(newWidth, newHeight);
+            uniforms.u_resolution.value.set(newWidth, newHeight);
+            
+            // Resize render targets
+            rt1.setSize(newWidth, newHeight);
+            rt2.setSize(newWidth, newHeight);
+        }
+        
+        window.addEventListener('resize', onWindowResize);
+        
+        // Animation loop
+        let lastTime = 0;
+        function animate(time) {
+            requestAnimationFrame(animate);
+            
+            // Calculate delta time
+            const delta = (time - lastTime) / 1000;
+            lastTime = time;
+            
+            // Update uniforms
+            uniforms.u_time.value = time * 0.001;
+            uniforms.u_delta.value = delta * parseFloat(document.getElementById('speed').value);
+            
+            // Ping-pong rendering
+            uniforms.u_previous.value = previous.texture;
+            
+            renderer.setRenderTarget(current);
+            renderer.render(scene, camera);
+            renderer.setRenderTarget(null);
+            
+            // Render to screen
+            renderer.render(scene, camera);
+            
+            // Swap buffers
+            const temp = previous;
+            previous = current;
+            current = temp;
+        }
+        
+        animate(0);
+    </script>
+
+              
+          
+                
+          
+              
+</body></html>
