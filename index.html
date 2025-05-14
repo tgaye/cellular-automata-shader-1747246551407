@@ -1,6 +1,6 @@
 <!DOCTYPE html><html><head><meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cellular Automata Shader</title>
+    <title>Cellular Automata Shader - NO ZOOM</title>
     <script src="https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.min.js"></script>
     <style>
         body {
@@ -107,6 +107,12 @@
                 <option value="3">Replicator (B1357/S1357)</option>
             </select>
         </div>
+        <div class="control-group">
+            <label for="zoom">Zoom Level</label>
+            <input type="range" id="zoom" min="-2" max="2" step="0.1" value="0">
+            <div class="value-display" id="zoom-value">1.0</div>
+            <button id="reset-zoom">Reset Zoom</button>
+        </div>
         
         <div class="control-group">
             <label>Preset Patterns</label>
@@ -168,11 +174,155 @@
             u_brush_pos: { value: new THREE.Vector2(0, 0) },
             u_brush_size: { value: 5 },
             u_rule_set: { value: 0 },
-            u_color_speed: { value: 0.2 }
+            u_color_speed: { value: 0.2 },
+            // Add these new uniforms for zoom
+            u_zoom: { value: 1.0 },
+            u_zoomCenter: { value: new THREE.Vector2(0.5, 0.5) }
         };
         
         // Main shader material
         const material = new THREE.ShaderMaterial({
+            uniforms: uniforms,
+            vertexShader: `
+                varying vec2 vUv;
+                
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+            precision highp float;
+            
+            uniform vec2 u_resolution;
+            uniform vec2 u_mouse;
+            uniform float u_time;
+            uniform float u_delta;
+            uniform sampler2D u_previous;
+            uniform float u_brush;
+            uniform vec2 u_brush_pos;
+            uniform float u_brush_size;
+            uniform int u_rule_set;
+            uniform float u_color_speed;
+            // Add zoom uniforms
+            uniform float u_zoom;
+            uniform vec2 u_zoomCenter;
+            
+            varying vec2 vUv;
+            
+            // Add zoom transform function
+            vec2 zoomTransform(vec2 uv) {
+                vec2 centered = uv - u_zoomCenter;
+                return centered / u_zoom + u_zoomCenter;
+            }
+            
+            // Game of Life rules
+            int gameOfLife(int neighbors, int current) {
+                if (current == 1) {
+                    if (neighbors < 2) return 0;
+                    if (neighbors > 3) return 0;
+                    return 1;
+                } else {
+                    if (neighbors == 3) return 1;
+                    return 0;
+                }
+            }
+                    
+                
+                // High Life rules (B36/S23)
+                int highLife(int neighbors, int current) {
+                    if (current == 1) {
+                        if (neighbors < 2) return 0;
+                        if (neighbors > 3) return 0;
+                        return 1;
+                    } else {
+                        if (neighbors == 3 || neighbors == 6) return 1;
+                        return 0;
+                    }
+                }
+                
+                // Maze rules (B3/S12345)
+                int maze(int neighbors, int current) {
+                    if (current == 1) {
+                        if (neighbors >= 1 && neighbors <= 5) return 1;
+                        return 0;
+                    } else {
+                        if (neighbors == 3) return 1;
+                        return 0;
+                    }
+                }
+                
+                // Replicator rules (B1357/S1357)
+                int replicator(int neighbors, int current) {
+                    if (neighbors == 1 || neighbors == 3 || neighbors == 5 || neighbors == 7) return 1;
+                    return 0;
+                }
+                
+               // Get cell state (1 = alive, 0 = dead)
+                float getState(vec4 color) {
+                    return step(0.1, color.a);
+                }
+                
+                // Get cell color
+                vec3 getColor(vec4 color) {
+                    return color.rgb;
+                }
+                
+                // Count live neighbors - don't apply zoom here
+                int countNeighbors(vec2 uv) {
+                    int count = 0;
+                    vec2 pixelSize = 1.0 / u_resolution;
+                    
+                    for (int y = -1; y <= 1; y++) {
+                        for (int x = -1; x <= 1; x++) {
+                            if (x == 0 && y == 0) continue;
+                            
+                            vec2 neighborUV = uv + vec2(float(x), float(y)) * pixelSize;
+                            vec4 neighbor = texture2D(u_previous, neighborUV);
+                            count += int(getState(neighbor));
+                        }
+                    }
+                    
+                    return count;
+                }
+                
+                // Apply brush effect - don't apply zoom here
+                vec4 applyBrush(vec2 uv, vec4 current) {
+                    if (u_brush > 0.5) {
+                        float dist = distance(uv, u_brush_pos) * u_resolution.x / u_brush_size;
+                        if (dist < 1.0) {
+                            return vec4(0.5 + 0.5 * sin(u_time * 0.5), 
+                                    0.5 + 0.5 * sin(u_time * 0.3), 
+                                    0.5 + 0.5 * sin(u_time * 0.7),
+                                    1.0);
+                        }
+                    }
+                    return current;
+                }
+                
+                // Main shader function
+                void main() {
+                    // Apply zoom transformation to the view only, not to the simulation
+                    vec2 zoomedUv = zoomTransform(vUv);
+                    
+                    // Skip rendering if outside zoomed area
+                    if (zoomedUv.x < 0.0 || zoomedUv.x > 1.0 || zoomedUv.y < 0.0 || zoomedUv.y > 1.0) {
+                        gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+                        return;
+                    }
+                    
+                    // Use the zoomed UV for texture sampling but not for simulation logic
+                    vec4 prev = texture2D(u_previous, zoomedUv);
+                    gl_FragColor = prev;
+                }
+                `
+            });
+        
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // Create a new simulation material
+        const simulationMaterial = new THREE.ShaderMaterial({
             uniforms: uniforms,
             vertexShader: `
                 varying vec2 vUv;
@@ -272,16 +422,16 @@
                     if (u_brush > 0.5) {
                         float dist = distance(uv, u_brush_pos) * u_resolution.x / u_brush_size;
                         if (dist < 1.0) {
-                        return vec4(0.5 + 0.5 * sin(u_time * 0.5), 
-                                0.5 + 0.5 * sin(u_time * 0.3), 
-                                0.5 + 0.5 * sin(u_time * 0.7),
-                                1.0);
+                            return vec4(0.5 + 0.5 * sin(u_time * 0.5), 
+                                    0.5 + 0.5 * sin(u_time * 0.3), 
+                                    0.5 + 0.5 * sin(u_time * 0.7),
+                                    1.0);
                         }
                     }
                     return current;
                 }
                 
-                // Main shader function
+                // Main shader function for simulation
                 void main() {
                     vec2 uv = vUv;
                     vec4 prev = texture2D(u_previous, uv);
@@ -363,9 +513,13 @@
                 }
             `
         });
+
+        // Create a separate mesh for simulation
+        const simulationMesh = new THREE.Mesh(geometry, simulationMaterial);
+        const simulationScene = new THREE.Scene();
+        simulationScene.add(simulationMesh);
         
-        const mesh = new THREE.Mesh(geometry, material);
-        scene.add(mesh);
+
         
         // Initialize simulation with random pattern
         function initializeRandom() {
@@ -823,36 +977,75 @@
         }
         
         window.addEventListener('resize', onWindowResize);
+
+        // Add these variables for zoom
+        let targetZoom = 0;
+
+        // Add zoom slider event listener
+        document.getElementById('zoom').addEventListener('input', (e) => {
+            targetZoom = parseFloat(e.target.value);
+            document.getElementById('zoom-value').textContent = Math.pow(2.0, targetZoom).toFixed(1);
+        });
+
+        // Add reset zoom button
+        document.getElementById('reset-zoom').addEventListener('click', () => {
+            targetZoom = 0;
+            document.getElementById('zoom').value = 0;
+            document.getElementById('zoom-value').textContent = '1.0';
+            uniforms.u_zoomCenter.value.set(0.5, 0.5);
+        });
+
+        // Add mouse wheel event for zoom
+        renderer.domElement.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const zoomDelta = -e.deltaY * 0.001;
+            targetZoom = Math.min(Math.max(targetZoom + zoomDelta, -2), 2);
+            document.getElementById('zoom').value = targetZoom;
+            document.getElementById('zoom-value').textContent = Math.pow(2.0, targetZoom).toFixed(1);
+            
+            // Set zoom center to mouse position
+            const rect = renderer.domElement.getBoundingClientRect();
+            const mouseX = (e.clientX - rect.left) / rect.width;
+            const mouseY = 1.0 - (e.clientY - rect.top) / rect.height;
+            uniforms.u_zoomCenter.value.set(mouseX, mouseY);
+        });
         
         // Animation loop
         let lastTime = 0;
+        // Modify the animation loop to update zoom
         function animate(time) {
-            requestAnimationFrame(animate);
-            
-            // Calculate delta time
-            const delta = (time - lastTime) / 1000;
-            lastTime = time;
-            
-            // Update uniforms
-            uniforms.u_time.value = time * 0.001;
-            uniforms.u_delta.value = delta * parseFloat(document.getElementById('speed').value);
-            
-            // Ping-pong rendering
-            uniforms.u_previous.value = previous.texture;
-            
-            renderer.setRenderTarget(current);
-            renderer.render(scene, camera);
-            renderer.setRenderTarget(null);
-            
-            // Render to screen
-            renderer.render(scene, camera);
-            
-            // Swap buffers
-            const temp = previous;
-            previous = current;
-            current = temp;
-        }
+        requestAnimationFrame(animate);
         
+        // Calculate delta time
+        const delta = (time - lastTime) / 1000;
+        lastTime = time;
+        
+        // Update uniforms
+        uniforms.u_time.value = time * 0.001;
+        uniforms.u_delta.value = delta * parseFloat(document.getElementById('speed').value);
+        
+        // Update zoom with smoothing
+        const currentZoom = uniforms.u_zoom.value;
+        const newZoom = currentZoom + (Math.pow(2.0, targetZoom) - currentZoom) * 0.1;
+        uniforms.u_zoom.value = newZoom;
+        
+        // 1. Ping-pong rendering for simulation using simulationMaterial
+        uniforms.u_previous.value = previous.texture;
+        
+        // Use simulationScene to render the next simulation state
+        renderer.setRenderTarget(current);
+        renderer.render(simulationScene, camera);
+        
+        // 2. Render final scene with zoom effect
+        renderer.setRenderTarget(null);
+        renderer.render(scene, camera);
+        
+        // Swap buffers
+        const temp = previous;
+        previous = current;
+        current = temp;
+    }
+            
         animate(0);
     </script>
 
